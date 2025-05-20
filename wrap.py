@@ -10,6 +10,31 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch import Trainer
 import torch
 
+cfg_base = {
+    # "data_dim": 8,
+    "in_len": 24,
+    "out_len": 24,
+    "seg_len": 2,
+    "window_size": 4,
+    "factor": 10,
+    "model_dim": 256,
+    "feedforward_dim": 512,
+    "head_num": 4,
+    "layer_num": 6,
+    "dropout": 0.2,
+    "baseline": False,
+    "learning_rate": 0.1,
+    "batch_size": 8,
+    "split": [0.7, 0.2, 0.1],
+    "seed": 2024,
+    "accelerator": "auto",
+    "min_epochs": 1,
+    "max_epochs": 200,
+    "precision": 32,
+    "patience": 5,
+    "num_workers": 31,
+}
+
 
 def setup_fit(
     cfg: dict, df: pd.DataFrame, callbacks: list = None, **kwargs
@@ -26,6 +51,9 @@ def setup_fit(
     Returns:
         tuple: A tuple containing the fitted model and the training history.
     """
+
+    # Automatically set the data_dim based on the input DataFrame
+    cfg["data_dim"] = df.shape[1]
 
     model = CrossFormer(cfg=cfg)
     data = DataInterface(df, **cfg)
