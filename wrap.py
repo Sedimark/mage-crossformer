@@ -3,11 +3,13 @@
 This wrap script is to provide interface for pipelines to call inside the mage
 """
 
+# from typing import Optional
 from crossformer.model.crossformer import CrossFormer
 from crossformer.data_tools.data_interface import DataInterface
+from crossformer.utils.metrics import hybrid_loss, metric
+from mlflow_mage.mlflow_saver import MlflowSaver, register_model
+from torch.optim import AdamW
 import pandas as pd
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-from lightning.pytorch import Trainer
 import torch
 
 cfg_base = {
@@ -29,62 +31,188 @@ cfg_base = {
     "seed": 2024,
     "accelerator": "auto",
     "min_epochs": 1,
-    "max_epochs": 200,
+    "max_epochs": 10,
     "precision": 32,
     "patience": 5,
     "num_workers": 31,
 }
 
 
-def setup_fit(
-    cfg: dict, df: pd.DataFrame, callbacks: list = None, **kwargs
-) -> tuple:
+def unpack_batch(batch, device):
+    (x, scale, y) = batch
+    x, scale, y = x.to(device), scale.to(device), y.to(device)
+    return x, scale, y
+
+
+def forward_step(model, x, scale):
+    y_hat = (
+        model(x) * scale.unsqueeze(1) if scale._is_zerotensor() else model(x)
+    )
+    return y_hat
+
+
+def dict_update(old_dict, new_dict):
+    merged_dict = old_dict.copy()
+    for key, value in new_dict.items():
+        if key in merged_dict:
+            merged_dict[key] += value
+        else:
+            merged_dict[key] = value
+    return merged_dict
+
+
+def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
     """
     Fit the model with the given configuration and data.
 
     Args:
         cfg (dict): Configuration dictionary.
         df (pd.DataFrame): DataFrame containing the data.
-        callbacks (list, optional): List of callbacks to use during training. Defaults to None.
         **kwargs: Additional keyword arguments.
 
     Returns:
         tuple: A tuple containing the fitted model and the training history.
     """
 
+    # update cfg with base settings
+
     # Automatically set the data_dim based on the input DataFrame
     cfg["data_dim"] = df.shape[1]
 
+    # Setup model and data
     model = CrossFormer(cfg=cfg)
     data = DataInterface(df, **cfg)
 
-    if callbacks is None:
-        # callbacks
-        model_ckpt = ModelCheckpoint(
-            monitor="val_SCORE",
-            mode="min",
-            save_top_k=1,
-            save_weights_only=False,
-        )
+    data.setup()
+    train_loader = data.train_dataloader()
+    val_loader = data.val_dataloader()
+    test_loader = data.test_dataloader()
 
-        early_stop = EarlyStopping(
-            monitor="val_SCORE",
-            patience=cfg["patience"],
-            mode="min",
-        )
-        callbacks = [model_ckpt, early_stop]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    criterion = hybrid_loss
+    optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
+    model.to(device)
 
-    trainer = Trainer(
-        accelerator=cfg["accelerator"],
-        precision=cfg["precision"],
-        min_epochs=cfg["min_epochs"],
-        max_epochs=cfg["max_epochs"],
-        check_val_every_n_epoch=1,
-        fast_dev_run=False,
-        callbacks=callbacks,
-    )
+    # input & output sample
+    model.eval()
+    input_example = torch.randn(1, cfg["in_len"], cfg["data_dim"])
+    with torch.no_grad():
+        output_example = model(input_example)
+    input_example = input_example.cpu().numpy()
+    output_example = output_example.cpu().numpy()
 
-    return model, data, trainer
+    # best performance tracking
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_model_uri = None
+    best_logs = {}
+
+    with MlflowSaver(run_name="pytorch_training") as mlflow_saver:
+        mlflow_saver.log_params(cfg)
+
+        for epoch in range(cfg["max_epochs"]):
+            with mlflow_saver.create_child_run(
+                run_name=f"epoch_{epoch}"
+            ) as epoch_saver:
+                running_loss = 0.0
+
+                # === Training step ===
+                model.train()
+                for step, batch in enumerate(train_loader):
+                    x, scale, y = unpack_batch(batch, device)
+                    y_hat = forward_step(model, x, scale)
+                    train_loss = criterion(y_hat, y)
+                    optimizer.zero_grad()
+                    train_loss.backward()
+                    optimizer.step()
+
+                    # training step logging
+                    # print(
+                    #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Step {step + 1}/{len(train_loader)}, Loss: {train_loss.item():.4f}"
+                    # )  # TODO: replace with mlflow logging
+                    running_loss += train_loss.item()
+
+                # Epoch training logging
+                epoch_loss = {"train_loss": running_loss / len(train_loader)}
+                # print(
+                #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Loss: {epoch_loss:.4f}"
+                # )  # TODO: replace with mlflow logging
+
+                # === Validation step ===
+                running_metrics = {}
+                model.eval()
+                with torch.no_grad():
+                    for step, batch in enumerate(val_loader):
+                        x, scale, y = unpack_batch(batch, device)
+                        y_hat = forward_step(model, x, scale)
+                        val_metrics = metric(y_hat, y)
+
+                        # validation step logging
+                        # print(
+                        #     f"Validation Step {step + 1}/{len(val_loader)}, Metrics: {val_metrics}"
+                        # )  # TODO: replace with mlflow logging
+                        running_metrics = dict_update(
+                            running_metrics, val_metrics
+                        )
+                # Validation epoch logging
+                epoch_metrics = {
+                    k: v / len(val_loader) for k, v in running_metrics.items()
+                }
+                # print(
+                #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Validation Metrics: {epoch_metrics}"
+                # )  # TODO: replace with mlflow logging
+
+                # === logging (epoch level only) ===
+                epoch_metrics = dict_update(epoch_metrics, epoch_loss)
+                epoch_saver.log_metrics(epoch_metrics, step=epoch)
+
+                epoch_saver.log_model(
+                    model=model,
+                    input_example=input_example,
+                    output_example=output_example,
+                    model_name=f"crossformer_{epoch}",
+                    framework="pytorch",
+                    pip_requirements=[f"torch=={torch.__version__}"],
+                )
+
+                try:
+                    model_uri = epoch_saver.model_uri
+
+                    if epoch_metrics["SCORE"] < best_val_loss:
+                        best_val_loss = epoch_metrics["SCORE"]
+                        best_epoch = epoch
+                        best_model_uri = model_uri
+                        print(
+                            f"New best model at epoch {epoch} with val_loss: {best_val_loss:.4f}"
+                        )
+                        best_logs = {
+                            "best_epoch": best_epoch,
+                            "best_val_loss": best_val_loss,
+                            "best_model_uri": best_model_uri,
+                        }
+                        best_logs.update(
+                            {f"best_{k}": v for k, v in epoch_metrics.items()}
+                        )
+                except Exception as e:
+                    print(f"Error getting model URI: {e}")
+
+        mlflow_saver.log_params(best_logs)
+
+        if best_model_uri:
+            try:
+                model_version = register_model(
+                    model_uri=best_model_uri,
+                    name="pytorch_crossformer",
+                    description=f"Best model from epoch {best_epoch} with validation loss {best_val_loss:.4f}",
+                    tags=best_logs.update(
+                        {"model_type": "pytorch_crossformer"}
+                    ),
+                )
+                print(f"Successfully registered model version: {model_version}")
+            except Exception as e:
+                print(f"Error registering model: {e}")
+        else:
+            print("No best model URI found to register")
 
 
 def inference(
@@ -107,3 +235,32 @@ def inference(
         predictions = model(input_tensor)
     df_predictions = pd.DataFrame(predictions.squeeze(0).numpy())
     return df_predictions
+
+
+if __name__ == "__main__":
+    import os
+
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = (
+        "http://localhost:9000"  # The endpoint for the minio api change only the port if modified in docker-compose.yaml
+    )
+    os.environ["AWS_ACCESS_KEY_ID"] = (
+        "admin"  # The username for the Minio instance
+    )
+    os.environ["AWS_SECRET_ACCESS_KEY"] = (
+        "minio_sedimark"  # The password for the Minio instance
+    )
+    os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"  # DO NOT MODIFY
+    os.environ["MLFLOW_FLASK_SERVER_SECRET_KEY"] = "mlflow_sedimark"
+    os.environ["MLFLOW_EXPERIMENT_NAME"] = "Default"
+    os.environ["MLFLOW_TRACKING_USERNAME"] = (
+        "admin"  # The username of the admin account for the MLFlow instance
+    )
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = (
+        "password"  # The password of the admin account for the MLFlow instance
+    )
+    os.environ["MLFLOW_TRACKING_URI"] = (
+        "http://localhost:5000"  # The URL for the MLFlow instance
+    )
+
+    df = pd.read_csv("broker_values.csv")
+    train(cfg=cfg_base, df=df)
