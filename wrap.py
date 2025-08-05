@@ -62,18 +62,19 @@ def dict_update(old_dict, new_dict):
     return merged_dict
 
 
-
-def evaluate_model(model, loader, device, prefix="val"):
+def evaluate_on_test_set(model, test_loader, device):
     model.eval()
     all_metrics = {}
     with torch.no_grad():
-        for step, batch in enumerate(loader):
+        for step, batch in enumerate(test_loader):
             x, scale, y = unpack_batch(batch, device)
             y_hat = forward_step(model, x, scale)
             batch_metrics = metric(y_hat, y)
             all_metrics = dict_update(all_metrics, batch_metrics)
-    avg_metrics = {f"{prefix}_{k}": v / len(loader) for k, v in all_metrics.items()}
-    return avg_metrics
+    test_metrics = {
+        f"test_{k}": v / len(test_loader) for k, v in all_metrics.items()
+    }
+    return test_metrics
 
 
 def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
@@ -147,7 +148,21 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                 epoch_loss = {"train_loss": running_loss / len(train_loader)}
 
                 # === Validation step ===
-                epoch_metrics = evaluate_model(model, val_loader, device, prefix="val")
+                running_metrics = {}
+                model.eval()
+                with torch.no_grad():
+                    for step, batch in enumerate(val_loader):
+                        x, scale, y = unpack_batch(batch, device)
+                        y_hat = forward_step(model, x, scale)
+                        val_metrics = metric(y_hat, y)
+
+                        running_metrics = dict_update(
+                            running_metrics, val_metrics
+                        )
+                # Validation epoch logging
+                epoch_metrics = {
+                    k: v / len(val_loader) for k, v in running_metrics.items()
+                }
 
                 # === logging (epoch level only) ===
                 epoch_metrics = dict_update(epoch_metrics, epoch_loss)
@@ -192,7 +207,9 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                     model_uri=best_model_uri,
                     name="pytorch_crossformer",
                     description=f"Best model from epoch {best_epoch} with validation loss {best_val_loss:.4f}",
-                    tags={**best_logs, "model_type": "pytorch_crossformer"},
+                    tags=best_logs.update(
+                        {"model_type": "pytorch_crossformer"}
+                    ),
                 )
 
                 print(f"Successfully registered model version: {model_version}")
@@ -200,20 +217,8 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
             except Exception as e:
                 print(f"Error registering model: {e}")
 
-            from mlflow.tracking import MlflowClient
-
-            client = MlflowClient()
-            client.transition_model_version_stage(
-                name="pytorch_crossformer",
-                version=model_version.version,
-                stage="Production",
-                archive_existing_versions=True,
-            )
-
-            model = mlflow.pytorch.load_model("models:/pytorch_crossformer/Production")
-            test_metrics = evaluate_model(model, test_loader, device, prefix="test")
-            mlflow_saver.log_metrics(test_metrics)
-            print(f"🧪 Test metrics: {test_metrics}")
+            model = mlflow.pytorch.load_model(f"models:/pytorch_crossformer/1")
+            print(evaluate_on_test_set(model, test_loader, device))
         else:
             print("No best model URI found to register")
 
