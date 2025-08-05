@@ -62,19 +62,18 @@ def dict_update(old_dict, new_dict):
     return merged_dict
 
 
-def evaluate_on_test_set(model, test_loader, device):
+
+def evaluate_model(model, loader, device, prefix="val"):
     model.eval()
     all_metrics = {}
     with torch.no_grad():
-        for step, batch in enumerate(test_loader):
+        for step, batch in enumerate(loader):
             x, scale, y = unpack_batch(batch, device)
             y_hat = forward_step(model, x, scale)
             batch_metrics = metric(y_hat, y)
             all_metrics = dict_update(all_metrics, batch_metrics)
-    test_metrics = {
-        f"test_{k}": v / len(test_loader) for k, v in all_metrics.items()
-    }
-    return test_metrics
+    avg_metrics = {f"{prefix}_{k}": v / len(loader) for k, v in all_metrics.items()}
+    return avg_metrics
 
 
 def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
@@ -148,21 +147,7 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                 epoch_loss = {"train_loss": running_loss / len(train_loader)}
 
                 # === Validation step ===
-                running_metrics = {}
-                model.eval()
-                with torch.no_grad():
-                    for step, batch in enumerate(val_loader):
-                        x, scale, y = unpack_batch(batch, device)
-                        y_hat = forward_step(model, x, scale)
-                        val_metrics = metric(y_hat, y)
-
-                        running_metrics = dict_update(
-                            running_metrics, val_metrics
-                        )
-                # Validation epoch logging
-                epoch_metrics = {
-                    k: v / len(val_loader) for k, v in running_metrics.items()
-                }
+                epoch_metrics = evaluate_model(model, val_loader, device, prefix="val")
 
                 # === logging (epoch level only) ===
                 epoch_metrics = dict_update(epoch_metrics, epoch_loss)
@@ -226,7 +211,7 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
             )
 
             model = mlflow.pytorch.load_model("models:/pytorch_crossformer/Production")
-            test_metrics = evaluate_on_test_set(model, test_loader, device)
+            test_metrics = evaluate_model(model, test_loader, device, prefix="test")
             mlflow_saver.log_metrics(test_metrics)
             print(f"🧪 Test metrics: {test_metrics}")
         else:
