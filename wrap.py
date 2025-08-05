@@ -207,9 +207,7 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                     model_uri=best_model_uri,
                     name="pytorch_crossformer",
                     description=f"Best model from epoch {best_epoch} with validation loss {best_val_loss:.4f}",
-                    tags=best_logs.update(
-                        {"model_type": "pytorch_crossformer"}
-                    ),
+                    tags={**best_logs, "model_type": "pytorch_crossformer"},
                 )
 
                 print(f"Successfully registered model version: {model_version}")
@@ -217,8 +215,20 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
             except Exception as e:
                 print(f"Error registering model: {e}")
 
-            model = mlflow.pytorch.load_model(f"models:/pytorch_crossformer/1")
-            print(evaluate_on_test_set(model, test_loader, device))
+            from mlflow.tracking import MlflowClient
+
+            client = MlflowClient()
+            client.transition_model_version_stage(
+                name="pytorch_crossformer",
+                version=model_version.version,
+                stage="Production",
+                archive_existing_versions=True,
+            )
+
+            model = mlflow.pytorch.load_model("models:/pytorch_crossformer/Production")
+            test_metrics = evaluate_on_test_set(model, test_loader, device)
+            mlflow_saver.log_metrics(test_metrics)
+            print(f"🧪 Test metrics: {test_metrics}")
         else:
             print("No best model URI found to register")
 
