@@ -8,6 +8,7 @@ from crossformer.model.crossformer import CrossFormer
 from crossformer.data_tools.data_interface import DataInterface
 from crossformer.utils.metrics import hybrid_loss, metric
 from mlflow_mage.mlflow_saver import MlflowSaver, register_model
+import mlflow
 from torch.optim import AdamW
 import pandas as pd
 import torch
@@ -31,7 +32,7 @@ cfg_base = {
     "seed": 2024,
     "accelerator": "auto",
     "min_epochs": 1,
-    "max_epochs": 10,
+    "max_epochs": 2,
     "precision": 32,
     "patience": 5,
     "num_workers": 31,
@@ -59,6 +60,21 @@ def dict_update(old_dict, new_dict):
         else:
             merged_dict[key] = value
     return merged_dict
+
+
+def evaluate_on_test_set(model, test_loader, device):
+    model.eval()
+    all_metrics = {}
+    with torch.no_grad():
+        for step, batch in enumerate(test_loader):
+            x, scale, y = unpack_batch(batch, device)
+            y_hat = forward_step(model, x, scale)
+            batch_metrics = metric(y_hat, y)
+            all_metrics = dict_update(all_metrics, batch_metrics)
+    test_metrics = {
+        f"test_{k}": v / len(test_loader) for k, v in all_metrics.items()
+    }
+    return test_metrics
 
 
 def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
@@ -126,17 +142,10 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                     train_loss.backward()
                     optimizer.step()
 
-                    # training step logging
-                    # print(
-                    #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Step {step + 1}/{len(train_loader)}, Loss: {train_loss.item():.4f}"
-                    # )  # TODO: replace with mlflow logging
                     running_loss += train_loss.item()
 
                 # Epoch training logging
                 epoch_loss = {"train_loss": running_loss / len(train_loader)}
-                # print(
-                #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Loss: {epoch_loss:.4f}"
-                # )  # TODO: replace with mlflow logging
 
                 # === Validation step ===
                 running_metrics = {}
@@ -147,10 +156,6 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                         y_hat = forward_step(model, x, scale)
                         val_metrics = metric(y_hat, y)
 
-                        # validation step logging
-                        # print(
-                        #     f"Validation Step {step + 1}/{len(val_loader)}, Metrics: {val_metrics}"
-                        # )  # TODO: replace with mlflow logging
                         running_metrics = dict_update(
                             running_metrics, val_metrics
                         )
@@ -158,9 +163,6 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                 epoch_metrics = {
                     k: v / len(val_loader) for k, v in running_metrics.items()
                 }
-                # print(
-                #     f"Epoch {epoch + 1}/{cfg['max_epochs']}, Validation Metrics: {epoch_metrics}"
-                # )  # TODO: replace with mlflow logging
 
                 # === logging (epoch level only) ===
                 epoch_metrics = dict_update(epoch_metrics, epoch_loss)
@@ -200,6 +202,7 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
 
         if best_model_uri:
             try:
+
                 model_version = register_model(
                     model_uri=best_model_uri,
                     name="pytorch_crossformer",
@@ -208,11 +211,18 @@ def train(cfg: dict, df: pd.DataFrame, **kwargs) -> None:
                         {"model_type": "pytorch_crossformer"}
                     ),
                 )
+
                 print(f"Successfully registered model version: {model_version}")
+
             except Exception as e:
                 print(f"Error registering model: {e}")
+
+            model = mlflow.pytorch.load_model(f"models:/pytorch_crossformer/1")
+            print(evaluate_on_test_set(model, test_loader, device))
         else:
             print("No best model URI found to register")
+
+    return "pytorch_crossformer"
 
 
 def inference(
@@ -235,32 +245,3 @@ def inference(
         predictions = model(input_tensor)
     df_predictions = pd.DataFrame(predictions.squeeze(0).numpy())
     return df_predictions
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ["MLFLOW_S3_ENDPOINT_URL"] = (
-        "http://localhost:9000"  # The endpoint for the minio api change only the port if modified in docker-compose.yaml
-    )
-    os.environ["AWS_ACCESS_KEY_ID"] = (
-        "admin"  # The username for the Minio instance
-    )
-    os.environ["AWS_SECRET_ACCESS_KEY"] = (
-        "minio_sedimark"  # The password for the Minio instance
-    )
-    os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"  # DO NOT MODIFY
-    os.environ["MLFLOW_FLASK_SERVER_SECRET_KEY"] = "mlflow_sedimark"
-    os.environ["MLFLOW_EXPERIMENT_NAME"] = "Default"
-    os.environ["MLFLOW_TRACKING_USERNAME"] = (
-        "admin"  # The username of the admin account for the MLFlow instance
-    )
-    os.environ["MLFLOW_TRACKING_PASSWORD"] = (
-        "password"  # The password of the admin account for the MLFlow instance
-    )
-    os.environ["MLFLOW_TRACKING_URI"] = (
-        "http://localhost:5000"  # The URL for the MLFlow instance
-    )
-
-    df = pd.read_csv("broker_values.csv")
-    train(cfg=cfg_base, df=df)
