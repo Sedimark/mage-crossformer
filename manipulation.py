@@ -9,24 +9,20 @@ from torch.optim import AdamW
 import pandas as pd
 import torch
 
+
 class BaseManipulation(ABC):
 
     @abstractmethod
-    def fit(
-        self,
-        **kwargs
-    ):
+    def train(self, **kwargs):
         raise NotImplementedError
-    
+
     @abstractmethod
-    def inference(
-        self,
-        **kwargs
-    ):
+    def inference(self, **kwargs):
         raise NotImplementedError
-    
+
 
 class MageCrossFormer(BaseManipulation):
+
     def __init__(self, cfg: dict = {}):
         self.cfg = {
             "in_len": 24,
@@ -55,30 +51,53 @@ class MageCrossFormer(BaseManipulation):
         if cfg != {}:
             self.cfg.update(cfg)
 
-    def _prepare_data(self, df: pd.DataFrame)-> List:
+    def _prepare_data(self, df: pd.DataFrame) -> List:
         dm = DataInterface(df, **self.cfg)
         dm.setup()
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
         test_loader = dm.test_dataloader()
         return [train_loader, val_loader, test_loader]
-    
-    def _create_signature(
-        self,
-        model
-    ):
-        input_example = torch.randn(1, self.cfg["in_len"], self.cfg["data_dim"]).to(model.device)
+
+    def _create_signature(self, model):
+        input_example = torch.randn(
+            1, self.cfg["in_len"], self.cfg["data_dim"]
+        ).to(model.device)
         model.eval()
         with torch.no_grad():
             output_example = model(input_example)
         input_example = input_example.cpu().numpy()
         output_example = output_example.cpu().numpy()
-        return [input_example, output_example]  
+        return [input_example, output_example]
 
-    def train(
-        self,
-        df: pd.DataFrame,
-    ):
+    def _model_evaluate(self, model, loader, device):
+        running_metrics = {}
+        with torch.no_grad():
+            model.eval()
+            for step, batch in enumerate(loader):
+                x, y = batch
+                x, y = x.to(device), y.to(device)
+                y_hat = model(x)
+                step_metrics = metric(y_hat, y)
+
+                if running_metrics == {}:
+                    running_metrics = {k: v for k, v in step_metrics.items()}
+                else:
+                    running_metrics = {
+                        k: running_metrics[k] + v
+                        for k, v in step_metrics.items()
+                    }
+
+            epoch_metrics = {
+                k: v / len(loader) for k, v in running_metrics.items()
+            }
+        return epoch_metrics
+
+    def train(self, df: pd.DataFrame = pd.DataFrame([]), **kwargs):
+
+        if df.empty:
+            raise ValueError("Input DataFrame is empty.")
+
         self.cfg["data_dim"] = df.shape[1]
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -90,12 +109,11 @@ class MageCrossFormer(BaseManipulation):
         criterion = hybrid_loss
         optimizer = AdamW(model.parameters(), lr=self.cfg["learning_rate"])
 
-        best_val_loss = float("inf")
-        best_epoch = -1
-        best_model_uri = None
-        best_logs = {}
-
-        
+        best_log = {
+            "SCORE": float("inf"),
+            "Epoch": -1,
+            "MODEL_URI": None,
+        }
 
         with MlflowSaver(run_name="pytorch_training") as mlflow_saver:
             mlflow_saver.log_params(self.cfg)
@@ -116,30 +134,14 @@ class MageCrossFormer(BaseManipulation):
                         train_loss.backward()
                         optimizer.step()
                         running_loss += train_loss.item()
-                    epoch_log = {"epoch_train_loss": running_loss / len(train_loader)}
-
-                    running_metrics = {}
-                    with torch.no_grad():
-                        model.eval()
-                        for step, batch in enumerate(val_loader):
-                            x, y = batch
-                            x, y = x.to(device), y.to(device)
-                            y_hat = model(x)
-                            step_metrics = metric(y_hat, y)
-                            
-                            if running_metrics == {}:
-                                running_metrics = {
-                                    k: v for k, v in step_metrics.items()
-                                }
-                            else:
-                                running_metrics = {
-                                    k: running_metrics[k] + v
-                                    for k, v in step_metrics.items()
-                                }
-
-                    epoch_metrics = {
-                        k: v / len(val_loader) for k, v in running_metrics.items()
+                    epoch_log = {
+                        "epoch_train_loss": running_loss / len(train_loader)
                     }
+
+                    epoch_metrics = self._model_evaluate(
+                        model, val_loader, device
+                    )
+
                     epoch_log.update(epoch_metrics)
                     epoch_saver.log_metrics(epoch_log, step=epoch)
                     epoch_saver.log_model(
@@ -152,6 +154,65 @@ class MageCrossFormer(BaseManipulation):
 
                     try:
                         model_uri = epoch_saver.model_uri
-                        if epoch_log["SCORE"] < best
+                        if epoch_log["SCORE"] < best_log["SCORE"]:
+                            best_log["SCORE"] = epoch_log["SCORE"]
+                            best_log["Epoch"] = epoch
+                            best_log["MODEL_URI"] = model_uri
+                    except Exception as e:
+                        print(f"Error getting model URI: {e}")
+            mlflow_saver.log_params(best_log)
+
+            if best_log["MODEL_URI"]:
+                try:
+                    model_version = register_model(
+                        model_uri=best_log["MODEL_URI"],
+                        name="pytorch_crossformer",
+                        description=f"Best model from epoch {best_log['Epoch']} with validation loss {best_log['SCORE']:.4f}",
+                        tags=best_log.update(
+                            {"model_type": "pytorch_crossformer"}
+                        ),
+                    )
+
+                    print(
+                        f"Successfully registered model version: {model_version}"
+                    )
+
+                    model = mlflow.pytorch.load_model(best_log["MODEL_URI"]).to(
+                        device
+                    )
+                    print(
+                        "Test set evaluation:",
+                        self._model_evaluate(model, test_loader, device),
+                    )
+                except Exception as e:
+                    print(f"Error registering model: {e}")
+
+            else:
+                print("No best model URI found to register.")
+
+        return "pytorch_crossformer"
+
+    def inference(
+        self, df: pd.DataFrame = pd.DataFrame([]), model=None, **kwargs
+    ) -> pd.DataFrame:
+        if df.empty:
+            raise ValueError("Input DataFrame is empty.")
+        if model is None:
+            raise ValueError("Model is not provided for inference.")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.eval()
+        input_tensor = (
+            torch.tensor(df.values, dtype=torch.float32).unsqueeze(0).to(device)
+        )
+        with torch.no_grad():
+            predictions = model(input_tensor)
+        df_predictions = pd.DataFrame(predictions.squeeze(0).cpu().numpy())
+        return df_predictions
 
 
+def initialize_manipulation(selection: str, **kwargs):
+    if selection == "mage_crossformer":
+        return MageCrossFormer(cfg=kwargs.get("cfg", {}))
+    else:
+        raise ValueError(f"Unknown manipulation selection: {selection}")
