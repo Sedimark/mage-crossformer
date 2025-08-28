@@ -95,6 +95,8 @@ class MageCrossFormer(BaseManipulation):
         best_model_uri = None
         best_logs = {}
 
+        
+
         with MlflowSaver(run_name="pytorch_training") as mlflow_saver:
             mlflow_saver.log_params(self.cfg)
 
