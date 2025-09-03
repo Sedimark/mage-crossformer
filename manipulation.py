@@ -20,6 +20,10 @@ class BaseManipulation(ABC):
     def inference(self, **kwargs):
         raise NotImplementedError
 
+    @abstractmethod
+    def prune(self, **kwargs):
+        raise NotImplementedError
+
 
 class MageCrossFormer(BaseManipulation):
 
