@@ -42,3 +42,27 @@ predictions = inference(model, data):
 
 ## Additional Information
 The wrap script will be cloned into the utils directory of the mage project. You can import and use these two functions in your pipelins. However, you need to start the fit or inference manually coperating the MLFLOW settings in pipelines.  
+
+
+## Update
+
+New python script "manipulation.py" is added to handle data manipulation tasks inside the mage blocks.
+
+1) Class BaseManipulation
+It provides the abstract methods for different data manipulation algorithm classes. Three common methods are included: train, inference, and prune. Each method needs to imlement its own logic.
+
+2) Function initialize_manipulation
+This function initializes the manipulation class based on the type name and configuration provided. It returns an instance of the corresponding manipulation class.
+
+3) Example of a manipulation class implementation
+MageCrossFormerManipulation is an example of a manipulation class that inherits from BaseManipulation. It implements the train, inference, and prune methods with specific logic for the CrossFormer model.
+
+4) Example usage
+```python
+from mage_crossformer.manipulation import initialize_manipulation, MageCrossFormerManipulation
+
+manipulation = initialize_manipulation("MageCrossFormerManipulation")
+
+manipulation.train(cfg, df)
+manipulation.inference(model, df)
+```
