@@ -3,6 +3,7 @@ from typing import List, Tuple, Optional
 from crossformer.model.crossformer import CrossFormer
 from crossformer.data_tools.data_interface import DataInterface
 from crossformer.utils.metrics import hybrid_loss, metric
+from crossformer.utils.tools import Preprocessor, Postprocessor
 from mlflow_mage.mlflow_saver import MlflowSaver, register_model
 import mlflow
 from torch.optim import AdamW
@@ -20,10 +21,13 @@ class BaseManipulation(ABC):
     def inference(self, **kwargs):
         raise NotImplementedError
 
+<<<<<<< HEAD
     @abstractmethod
     def prune(self, **kwargs):
         raise NotImplementedError
 
+=======
+>>>>>>> 2e2adbe (Refactor MageCrossFormer class to improve training and evaluation methods, and remove unused temp.py file)
 
 class MageCrossFormer(BaseManipulation):
 
@@ -206,6 +210,7 @@ class MageCrossFormer(BaseManipulation):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
         model.eval()
+<<<<<<< HEAD
         input_tensor = (
             torch.tensor(df.values, dtype=torch.float32).unsqueeze(0).to(device)
         )
@@ -215,6 +220,26 @@ class MageCrossFormer(BaseManipulation):
         return df_predictions
 
 
+=======
+
+
+        preprocessor = Preprocessor(method="minmax",per_feature=True)
+        preprocessor.fit(df.values)
+        df = preprocessor.transform(df.values)
+        stats = preprocessor.export()
+        postprocessor = Postprocessor(stats=stats)
+
+        input_tensor = (
+            torch.tensor(df.values, dtype=torch.float32).unsqueeze(0).to(device)
+        )
+        with torch.no_grad():
+            predictions = model(input_tensor)
+        df_predictions = pd.DataFrame(predictions.squeeze(0).cpu().numpy())
+        df_predictions = pd.DataFrame(postprocessor.inverse_transform(df_predictions.values))
+        return df_predictions
+
+
+>>>>>>> 2e2adbe (Refactor MageCrossFormer class to improve training and evaluation methods, and remove unused temp.py file)
 def initialize_manipulation(selection: str, **kwargs):
     if selection == "mage_crossformer":
         return MageCrossFormer(cfg=kwargs.get("cfg", {}))
