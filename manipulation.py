@@ -210,19 +210,7 @@ class MageCrossFormer(BaseManipulation):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
         model.eval()
-<<<<<<< HEAD
-        input_tensor = (
-            torch.tensor(df.values, dtype=torch.float32).unsqueeze(0).to(device)
-        )
-        with torch.no_grad():
-            predictions = model(input_tensor)
-        df_predictions = pd.DataFrame(predictions.squeeze(0).cpu().numpy())
-        return df_predictions
-
-
-=======
-
-
+        
         preprocessor = Preprocessor(method="minmax",per_feature=True)
         preprocessor.fit(df.values)
         df = preprocessor.transform(df.values)
@@ -239,7 +227,7 @@ class MageCrossFormer(BaseManipulation):
         return df_predictions
 
 
->>>>>>> 2e2adbe (Refactor MageCrossFormer class to improve training and evaluation methods, and remove unused temp.py file)
+
 def initialize_manipulation(selection: str, **kwargs):
     if selection == "mage_crossformer":
         return MageCrossFormer(cfg=kwargs.get("cfg", {}))
